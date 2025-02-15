@@ -22,16 +22,22 @@ func Retry(ctx context.Context, fn func() error, cfg Config) error {
 	log.Printf("Starting retry process: MaxRetries=%d, BackoffStrategy=%v", cfg.MaxRetries, cfg.BackoffStrategy)
 
 	for i := 0; i < cfg.MaxRetries; i++ {
+
 		if !cb.ShouldRetry() {
 			log.Println("Circuit breaker triggered, stopping retries")
 			return ErrCircuitBreaker
 		}
 
 		err = fn()
-		if err == nil || !isRetryable(err, cfg) {
+		if err == nil {
 			log.Printf("Success on attempt %d", i+1)
-			cb.RecordSuccess()
+			cb.Reset() // Reset circuit breaker on success
 			return nil
+		}
+
+		if i == cfg.MaxRetries-1 {
+			log.Println("Max retries reached.")
+			return ErrMaxRetries
 		}
 
 		cb.RecordFailure()

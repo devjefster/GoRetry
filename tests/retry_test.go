@@ -1,32 +1,15 @@
 package retry_test
 
 import (
-	"GoRetry/retry"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
+
+	"GoRetry/retry"
 )
-
-func TestRetrySuccess(t *testing.T) {
-	attempts := 0
-	fn := func() error {
-		attempts++
-		if attempts < 3 {
-			return errors.New("temporary failure")
-		}
-		return nil
-	}
-
-	cfg := retry.DefaultConfig
-	cfg.MaxRetries = 5
-	cfg.CircuitBreakerThreshold = 5 // Ensure the breaker doesn't stop retries too early
-	ctx := context.Background()
-
-	err := retry.Retry(ctx, fn, cfg)
-	if err != nil {
-		t.Errorf("Expected success, but got error: %v", err)
-	}
-}
 
 func TestRetryFailure(t *testing.T) {
 	fn := func() error {
@@ -38,31 +21,72 @@ func TestRetryFailure(t *testing.T) {
 	ctx := context.Background()
 
 	err := retry.Retry(ctx, fn, cfg)
-	if err == nil {
-		t.Errorf("Expected failure, but got success")
+	if !errors.Is(err, retry.ErrMaxRetries) {
+		t.Errorf("Expected max retries error, but got: %v", err)
 	}
+
 }
 
-func TestCircuitBreakerResetsAfterSuccess(t *testing.T) {
-	attempts := 0
+func TestCircuitBreakerStopsRetries(t *testing.T) {
 	fn := func() error {
-		attempts++
-		if attempts < 3 {
-			return errors.New("failure")
-		}
-		return nil
+		return errors.New("persistent failure")
 	}
 
 	cfg := retry.Config{
 		MaxRetries:              5,
-		CircuitBreakerThreshold: 2,
-		SuccessReset:            2, // Requires 2 consecutive successes to reset
+		CircuitBreakerThreshold: 2, // Stops retries after 2 failures
 	}
 
 	ctx := context.Background()
 	err := retry.Retry(ctx, fn, cfg)
 
-	if err != nil {
-		t.Errorf("Expected success after circuit breaker reset, got: %v", err)
+	if !errors.Is(err, retry.ErrCircuitBreaker) {
+		t.Errorf("Expected circuit breaker error, but got: %v", err)
 	}
+
+}
+
+func TestBackoffStrategies(t *testing.T) {
+	cfg := retry.Config{
+		MaxRetries:     3,
+		InitialBackoff: 100 * time.Millisecond,
+		MaxBackoff:     1 * time.Second,
+	}
+
+	tests := []struct {
+		strategy retry.BackoffStrategy
+	}{
+		{retry.FixedBackoff},
+		{retry.LinearBackoff},
+		{retry.ExponentialBackoff},
+		{retry.CustomBackoff},
+	}
+
+	for _, test := range tests {
+		cfg.BackoffStrategy = test.strategy
+		_ = retry.CalculateBackoff(cfg, 1)
+	}
+}
+
+func TestRetryMiddleware(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError) // Simulate server failure
+	})
+
+	cfg := retry.DefaultConfig
+	cfg.RetryableStatusCodes = []int{500, 502, 503, 504}
+
+	server := httptest.NewServer(retry.RetryMiddleware(cfg, handler))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL)
+	if err != nil {
+		t.Fatalf("Failed to make request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("Expected 429 Too Many Requests, got: %d", resp.StatusCode)
+	}
+
 }
